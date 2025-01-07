@@ -1,0 +1,237 @@
+---
+title: "Analyses with additional variables"
+output: html_document
+date: '2023-05-26'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lme4)
+library(lmerTest)
+library(performance)
+library(data.table)
+library(dtplyr)
+library(dplyr)
+library(haven)
+library(texreg)
+library(writexl)
+```
+
+Grouping structure
+
+1. Student pair
+  - variables: Co-infection (outcome), Distance
+
+2. Program
+  - variables: Program size
+  
+3. School
+  - variables: School size, Denomination, Avg income in postcode (~can affect multiple schools)
+  
+4. Gemeente
+  - variables: 
+
+
+# MLM overall
+
+## Read data
+
+```{r}
+dat <- readRDS("H:/Mamba_3.10/additional_variables/net_bo.RDS")
+
+# add program and school id to data
+dat <- dat %>% 
+  # also: recode coinfection
+  mutate(across(matches("^coinfect_[0-9]"),
+                ~case_when(.x == TRUE ~ 1,
+                           .x == FALSE ~ 0,
+                           is.na(.x) ~ 0))) %>% 
+  group_by(WPOBRIN_crypt, WPOBRINVEST) %>% 
+  mutate(school_id = cur_group_id()) %>% 
+  ungroup() %>% 
+  # (omit wpotypepo because all NA)
+  group_by(WPOBRIN_crypt, WPOBRINVEST, WPOLEERJAAR, WPOOPLNR) %>%
+  mutate(program_id = cur_group_id()) %>% 
+  ungroup()
+
+length(unique(dat$program_id))
+length(unique(dat$school_id))
+length(unique(dat$gemcode))
+
+sum(dat$coinfect_14days)
+sum(dat$coinfect_14days)/nrow(dat)
+```
+
+## Sampling
+
+```{r}
+# sample 5% of schools
+set.seed(789)
+school_sample <- dat %>% 
+  select(school_id, school_size) %>% 
+  distinct() %>% 
+  slice_sample(weight_by = school_size, prop = 0.05)
+
+dat_sch <- dat %>% 
+  semi_join(y = school_sample)
+
+# subset to complete cases from model with predictors
+dat_sch <- 
+  dat_sch[complete.cases(dat_sch[,colnames(m2c@frame)]),]
+
+# add standardized predictors
+dat_sch$distanceS <- scale(dat_sch$distance, scale = TRUE)
+dat_sch$school_sizeS <- scale(dat_sch$school_size, scale = TRUE)
+dat_sch$income_post_meanS <- scale(dat_sch$income_post_mean, scale = TRUE)
+
+length(unique(dat_sch$program_id))
+length(unique(dat_sch$school_id))
+length(unique(dat_sch$gemcode))
+
+skimr::skim(dat_sch)
+
+with(dat_sch, summary(data.frame(distance, program_size, school_size, income_post_mean)))
+                  
+with(dat_sch, cor(data.frame(distance, program_size, school_size, income_post_mean), 
+                  use = "complete.obs"))
+
+table(dat_sch$WPODENOMINATIE)
+
+sum(dat_sch$coinfect_14days)
+sum(dat_sch$coinfect_14days)/nrow(dat_sch)
+```
+
+## Define Models
+
+General formula: y ~ (1 | g1) + (1 | g1:g2) ...
+
+  -> two hierarchical grouping factors (g1, g2), where g2 is nested in g1 (g1 would be schools and g2 classes e.g.)
+  -> here: random intercept model, add variables between "(" and "|" for random slopes
+  -> by default intercept and slope are correlated, to remove replace "|" with "||"
+     
+```{r}
+
+# Singular fit, no variance in gemeente beyond program and schools
+Sys.time()
+m1_sch <- glmer(coinfect_14days ~ (1 | gemcode) + (1 | gemcode:school_id) + (1 | gemcode:school_id:program_id),
+                family = binomial(), data = dat_sch)
+Sys.time() #takes 50 mins
+
+Sys.time()
+m1_sch_nogem <- glmer(coinfect_14days ~ (1 | school_id) + (1 | school_id:program_id),
+                      family = binomial(), data = dat_sch)
+Sys.time() # takes 25 mins
+
+Sys.time()
+m1_sch_nopro <- glmer(coinfect_14days ~ (1 | gemcode) + (1 | gemcode:school_id),
+                      family = binomial(), data = dat_sch)
+Sys.time() # takes 18 mins
+
+Sys.time()
+m1_sch_gem <- glmer(coinfect_14days ~ (1 | gemcode),
+                    family = binomial(), data = dat_sch)
+Sys.time() # takes 6 mins
+
+```
+
+Add predictors
+
+```{r}
+# 2. Intercept only with predictors
+Sys.time()
+m2 <- glmer(coinfect_14days ~ 
+              distance + program_size + school_size + WPODENOMINATIE + income_post_mean +
+              (1 | school_id) + (1 | school_id:program_id),
+            family = binomial(), data = dat_sch)
+Sys.time()
+
+summary(m2)
+
+
+# With centered predictors
+# also omit program size because wrongly calculated
+
+dat_sch$distanceC <- scale(dat_sch$distance, scale = FALSE)
+dat_sch$school_sizeC <- scale(dat_sch$school_size, scale = FALSE)
+dat_sch$income_post_meanC <- scale(dat_sch$income_post_mean, scale = FALSE)
+  
+Sys.time()
+m2b <- glmer(coinfect_14days ~ 
+              distanceC + school_sizeC + WPODENOMINATIE + income_post_meanC +
+              (1 | school_id) + (1 | school_id:program_id),
+            family = binomial(), data = dat_sch)
+Sys.time() # took 9hrs
+
+summary(m2b)
+
+
+# With centered AND SCALED predictors
+# also omit program size because wrongly calculated
+# and use gemeente and school, omit program
+  
+Sys.time()
+m2c <- glmer(coinfect_14days ~ 
+              distanceS + school_sizeS + WPODENOMINATIE + income_post_meanS +
+              (1 | gemcode) + (1 | gemcode:school_id),
+            family = binomial(), data = dat_sch)
+Sys.time() # took 6hrs
+
+summary(m2c)
+
+
+# With centered AND SCALED predictors
+# also omit program size because wrongly calculated
+# and ONLY use gemeente, omit school and program
+
+Sys.time()
+m2d <- glmer(coinfect_14days ~ 
+              distanceS + school_sizeS + WPODENOMINATIE + income_post_meanS +
+              (1 | gemcode),
+            family = binomial(), data = dat_sch)
+Sys.time() # took 7hrs
+
+summary(m2d)
+```
+
+
+# Final model export
+
+```{r}
+screenreg(list(m1_sch_nopro, m2c))
+
+setwd("H:/Mamba_3.10/additional_variables/results")
+
+# 1. Regression tables
+# Output in word and later copy into excel
+wordreg(m1_sch_nopro, file = "m1_null.doc")
+wordreg(m2c, file = "m2_gemsch.doc")
+
+# 2. Covariance matrix
+vcov(m2c) %>% 
+  as.matrix() %>% 
+  as.data.frame() %>% 
+  write_xlsx("H:/Mamba_3.10/additional_variables/results/m2_vcov.xlsx")
+  
+# 3a. Random effects gemeente
+ranef(m2c, whichel = c("gemcode")) %>% 
+  as.data.frame() %>% 
+  write_xlsx("H:/Mamba_3.10/additional_variables/results/m2_ranf_gem.xlsx")
+
+# 3b. Random effects school
+ranef(m2c, whichel = c("gemcode:school_id")) %>% 
+  as.data.frame() %>% 
+  write_xlsx("H:/Mamba_3.10/additional_variables/results/m2_ranf_sch.xlsx")
+
+# 4. Descriptive stats
+skimdf <- dat_sch %>% 
+  mutate(WPODENOMINATIE = as.factor(WPODENOMINATIE)) %>% 
+  select(c('coinfect_14days', "distanceS", "school_sizeS", "WPODENOMINATIE", "income_post_meanS")) %>% 
+  skimr::skim()
+  
+skimdf %>% 
+  select(-numeric.hist) %>% 
+  #modelsummary::datasummary_skim(histogram = FALSE) %>% 
+  as.data.frame() %>% 
+  write_xlsx("H:/Mamba_3.10/additional_variables/results/descriptives.xlsx")
+```

@@ -1,0 +1,350 @@
+---
+title: "Creation of Addtional Variables"
+output: html_document
+date: '2023-05-16'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(haven)
+library(data.table)
+library(dtplyr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(arrow)
+```
+
+# File paths
+
+```{r}
+# Network data
+net_bo_path <- "H:/Mamba_3.10/network_creation/data/projected/bo_2020.tsv"
+net_vo_path <- "H:/Mamba_3.10/network_creation/data/projected/vo_2020.tsv"
+
+# Student data
+student_bo_path <- "G:/Onderwijs/INSCHRWPOTAB/INSCHRWPOTAB2020V2.sav"
+student_vo_path <- "G:/Onderwijs/ONDERWIJSINSCHRTAB/ONDERWIJSINSCHRTAB2020V2.sav"
+
+# School data
+school_path <- "G:/Onderwijs/BRINADRESSEN/BRINADRESSEN2020V1.sav"
+
+# Covid data
+covid_path <- "G:/Maatwerk/CORONIT/CoronIT_GGD_testdata_20210921.sav"
+
+# Personal addresses
+address_path <- "G:/Bevolking/GBAADRESOBJECTBUS/geconverteerde data/GBAADRESOBJECT2021BUSV1.csv"
+
+# Coordinates of personal addresses
+coord_path <- "G:/BouwenWonen/VSLVIERKANTTAB/VRLVSLVIERKANTTABV2022031.sav"
+
+# Postcodes by person
+postcode_path <- "G:/BouwenWonen/VSLPOSTCODEBUS/VSLPOSTCODEBUSV2022031.sav"
+
+# Income data
+income_path <- "G:/InkomenBestedingen/INPATAB/INPA2020TABV2.sav"
+```
+
+# Read network data
+
+```{r}
+net_bo <- fread(file = net_bo_path, verbose = TRUE, sep = "\t") %>% 
+  mutate(WPOBRINVEST = ifelse(WPOBRINVEST %in% c("01", "02", "03", "04"), WPOBRINVEST, "00"))
+
+# check asymmetry of source-target
+# net_bo %>% 
+#   zap_label() %>% 
+#   arrow_table() %>% 
+#   filter(!is.na(RINPERSOON1) & !is.na(RINPERSOON2)) %>% 
+#   mutate(fromto = paste(RINPERSOON1, RINPERSOON2, sep = "_"),
+#          tofrom = paste(RINPERSOON2, RINPERSOON1, sep = "_")) %>% 
+#   filter((fromto %in% tofrom) | (tofrom %in% fromto)) %>% 
+#   collect()
+# -> no observations, is okay
+```
+
+# BASIS ONDERWIJS
+
+## Class and program size
+
+```{r}
+# read school data
+student_bo_raw <- read_sav(student_bo_path, 
+                           col_select = c("RINPERSOONS", "RINPERSOON", "ONDERWIJSNR_crypt", 
+                                          "WPOBRIN_crypt","WPOBRINVEST", "WPOLEERJAAR", "WPOOPLNR",
+                                          "WPOTYPEPO", "WPOVERBLIJFSJRBO", "WPODENOMINATIE"))
+
+school_size <- student_bo_raw %>% 
+  as.data.table() %>% 
+  group_by(WPOBRIN_crypt, WPOBRINVEST) %>% 
+  summarise(school_size = n()) %>% 
+  ungroup()
+
+program_size <- student_bo_raw %>% 
+  as.data.table() %>% 
+  # (omit wpotypepo because all NA)
+  group_by(WPOBRIN_crypt, WPOBRINVEST, WPOLEERJAAR, WPOOPLNR) %>% 
+  summarise(program_size = n()) %>% 
+  ungroup()
+
+net_bo1 <- net_bo %>% 
+  mutate(WPOLEERJAAR = as.character(WPOLEERJAAR)) %>%
+  left_join(school_size) %>%
+  left_join(program_size)
+
+rm(net_bo)
+```
+
+## Gemeente of school
+
+```{r}
+school_raw <- read_sav(school_path, 
+                       col_select = c("BRIN_crypt", "BRINVest", "gemcode", "POSTCODE"))
+
+# semi_join() returns all rows from x with a match in y
+school_dat <- school_raw %>% 
+  semi_join(y = net_bo1[,c("WPOBRIN_crypt", "WPOBRINVEST")], 
+            by = c("BRIN_crypt" = "WPOBRIN_crypt", "BRINVest" = "WPOBRINVEST"))
+
+net_bo2 <- net_bo1 %>% 
+  left_join(school_dat, by = c("WPOBRIN_crypt" = "BRIN_crypt", "WPOBRINVEST" = "BRINVest"))
+
+rm(net_bo1)
+```
+
+
+## Distances between students
+
+### Get addresses in sample
+
+```{r}
+address_raw <- fread(file = address_path, verbose = TRUE, sep = ";")
+
+# semi_join() returns all rows from x with a match in y
+# do this for source and target nodes
+address_dat1 <- address_raw %>% 
+  semi_join(y = net_bo[,"RINPERSOON1"], by = c("RINPERSOON" = "RINPERSOON1"))
+
+address_dat2 <- address_raw %>% 
+  semi_join(y = net_bo[,"RINPERSOON2"], by = c("RINPERSOON" = "RINPERSOON2"))
+
+# combine addresses of source and target into one object
+address_dat <- rbind(address_dat1, address_dat2) %>% 
+  # remove duplicates resulting from previous step (network partly symmetric)
+  distinct() %>% 
+  filter(GBADATUMAANVANGADRESHOUDING < 20210000) %>% 
+  group_by(RINPERSOON, RINPERSOONS) %>% 
+  # get only last registered address 
+  filter(GBADATUMAANVANGADRESHOUDING == max(GBADATUMAANVANGADRESHOUDING)) %>% 
+  ungroup()
+
+rm(address_raw, address_dat1, address_dat2)
+```
+
+### Coordinates of addresses
+
+```{r}
+coord_raw <- read_sav(coord_path,
+                      col_select = c("SOORTOBJECTNUMMER", "RINOBJECTNUMMER", "VRLVIERKANT100M"))
+
+coord_dat <- address_dat %>% 
+  left_join(coord_raw)
+
+coord1 <- net_bo2[,c("RINPERSOON1")] %>% 
+  left_join(coord_dat[,c("RINPERSOON", "VRLVIERKANT100M")],
+            by = c("RINPERSOON1" = "RINPERSOON")) %>% 
+  mutate(east = as.integer(str_sub(VRLVIERKANT100M, start = 2, end = 5)),
+         north = as.integer(str_sub(VRLVIERKANT100M, start = 7, end = 10))) %>% 
+  rename_with(.cols = -RINPERSOON1, ~paste0(.x, "1")) %>% 
+  distinct()
+
+coord2 <- net_bo2[,c("RINPERSOON2")] %>% 
+  left_join(coord_dat[,c("RINPERSOON", "VRLVIERKANT100M")],
+            by = c("RINPERSOON2" = "RINPERSOON")) %>%
+  mutate(east = as.integer(str_sub(VRLVIERKANT100M, start = 2, end = 5)),
+         north = as.integer(str_sub(VRLVIERKANT100M, start = 7, end = 10))) %>% 
+  rename_with(.cols = -RINPERSOON2, ~paste0(.x, "2")) %>% 
+  distinct()
+```
+
+### Distances between students
+
+```{r}
+net_bo3 <- net_bo2 %>% 
+  left_join(coord1, by = "RINPERSOON1") %>% 
+  left_join(coord2, by = "RINPERSOON2") %>% 
+  mutate(distance = 52 + sqrt((east1 - east2)**2 + (north1 - north2)**2))
+
+rm(net_bo2)
+```
+
+
+## Covid
+
+```{r}
+covid_raw <- read_sav(covid_path)
+
+covid_arr <- covid_raw %>% 
+  zap_labels() %>% 
+  arrow_table()
+
+positives_dat <- covid_arr %>% 
+  # remove without bsn
+  filter(RINPERSOON != 	'""') %>% 
+  # add time variables
+  mutate(DatumMonsterafname = ymd(DatumMonsterafname),
+         Testuitslag = Testuitslag != "NEGATIEF",
+         time_afname = as_datetime(paste(DatumMonsterafname, TijdstipMonsterafname))) %>% 
+  filter(Testuitslag == TRUE) %>% 
+  arrange(RINPERSOON, time_afname) %>% 
+  collect() %>% 
+  group_by(RINPERSOON) %>% 
+  slice_head(n = 1) %>% 
+  ungroup()
+
+saveRDS(positives_dat, "H:/Mamba_3.10/additional_variables/positives_dat.RDS")
+
+# first positive result for source and target
+positive1 <- net_bo3[,c("RINPERSOON1")] %>%
+  mutate(RINPERSOON1 = as.character(RINPERSOON1)) %>% 
+  left_join(positives_dat[,c("RINPERSOON", "DatumMonsterafname")],
+            by = c("RINPERSOON1" = "RINPERSOON")) %>% 
+  mutate(RINPERSOON1 = as.numeric(RINPERSOON1)) %>% 
+  rename_with(.cols = -RINPERSOON1, ~paste0(.x, "1")) %>% 
+  distinct()
+
+positive2 <- net_bo3[,c("RINPERSOON2")] %>% 
+  mutate(RINPERSOON2 = as.character(RINPERSOON2)) %>% 
+  left_join(positives_dat[,c("RINPERSOON", "DatumMonsterafname")],
+            by = c("RINPERSOON2" = "RINPERSOON")) %>% 
+  mutate(RINPERSOON2 = as.numeric(RINPERSOON2)) %>% 
+  rename_with(.cols = -RINPERSOON2, ~paste0(.x, "2")) %>% 
+  distinct()
+
+net_bo4 <- net_bo3 %>% 
+  left_join(positive1) %>% 
+  left_join(positive2) %>% 
+  mutate(coinfect_days = 
+           as.integer(difftime(DatumMonsterafname1, DatumMonsterafname2, units = "days")),
+         coinfect_3days = abs(coinfect_days) <= 3,
+         coinfect_7days = abs(coinfect_days) <= 7,
+         coinfect_14days = abs(coinfect_days) <= 14)
+
+rm(net_bo3)
+
+saveRDS(net_bo4, "H:/Mamba_3.10/additional_variables/net_bo4.RDS")
+
+net_bo4 %>% 
+  filter(coinfect_14days == TRUE)
+
+min(net_bo4$DatumMonsterafname1, na.rm = TRUE)
+min(net_bo4$DatumMonsterafname2, na.rm = TRUE)
+max(net_bo4$DatumMonsterafname1, na.rm = TRUE)
+max(net_bo4$DatumMonsterafname2, na.rm = TRUE)
+```
+
+## Average income in postcode area
+
+```{r}
+# income data
+income_raw <- read_sav(income_path, 
+                       col_select = c("RINPERSOONS", "RINPERSOON", "INPBELI"))
+
+# recode to NA for non-registered income
+income_raw$INPBELI[income_raw$INPBELI == 9999999999] <- NA
+income_raw$RINPERSOON <- as.integer(income_raw$RINPERSOON)
+
+
+# postcodes of housing objects
+postcode_raw <- read_sav(postcode_path)
+
+postcode_dat <- postcode_raw %>%
+  zap_labels() %>%
+  as.data.table() %>% 
+  group_by(SOORTOBJECTNUMMER, RINOBJECTNUMMER) %>% 
+  filter(DATUMAANVPOSTCODENUMADRES == max(DATUMAANVPOSTCODENUMADRES)) %>% 
+  ungroup()
+  
+# housing objects of people 
+address_raw <- fread(file = address_path, verbose = TRUE, sep = ";")
+
+# calculate average income in postcodes where people live in 2020
+income_postcode <- address_raw %>% 
+  filter(GBADATUMAANVANGADRESHOUDING < 20210000) %>% 
+  group_by(RINPERSOON, RINPERSOONS) %>% 
+  # get only last registered address 
+  filter(GBADATUMAANVANGADRESHOUDING == max(GBADATUMAANVANGADRESHOUDING)) %>% 
+  ungroup() %>% 
+  left_join(y = postcode_dat[,c("SOORTOBJECTNUMMER", "RINOBJECTNUMMER", "POSTCODENUM")]) %>% 
+  left_join(y = income_raw) %>% 
+  as.data.table() %>% 
+  group_by(POSTCODENUM) %>% 
+  summarise(income_post_mean = mean(INPBELI, na.rm = TRUE),
+            income_post_median = median(INPBELI, na.rm = TRUE))
+
+# merge network and average income
+net_bo5 <- net_bo4 %>% 
+  # convert dates to integers in network data (couldve been done before)
+  mutate(across(c("DatumMonsterafname1", "DatumMonsterafname2"),
+                ~as.integer(
+                  paste0(year(.x), 
+                         str_pad(month(.x), width = 2, side = "left", pad = "0"), 
+                         str_pad(day(.x), width = 2, side = "left", pad = "0" )
+                         )
+                  )
+                )
+         ) %>% 
+  left_join(income_postcode, by = c("POSTCODE" = "POSTCODENUM")) %>% 
+  as.data.table()
+
+#saveRDS(net_bo5, "H:/Mamba_3.10/additional_variables/net_bo5.RDS")
+```
+
+
+## Split data into schools closed vs. schools open based on co-infection date
+
+```{r}
+# time range of positive tests in data
+range(net_bo5$DatumMonsterafname1, na.rm = TRUE)
+range(net_bo5$DatumMonsterafname2, na.rm = TRUE)
+# -> 2020/06/01 - 2021/08/31
+
+# define dates where schools were closed
+close_times <- c("s1" = 20200702, "e1" = 20200816,
+                 "s2" = 20201218, "e2" = 20210207,
+                 "s3" = 20210501, "e3" = 20210905,
+                 "s4" = 20210717, "e4" = 20210829)
+
+# data set with only co-infections during OPEN schools
+net_bo_open <- net_bo5 %>% 
+  rowwise() %>% 
+         # get date of co-infection (=the later of both infections)
+  mutate(coinfect_date = max(DatumMonsterafname1, DatumMonsterafname2)) %>% 
+  ungroup() %>%  
+         # filter for co-infections not in closing times
+  filter(!(coinfect_date >= close_times[1] & coinfect_date <= close_times[2]) &
+         !(coinfect_date >= close_times[3] & coinfect_date <= close_times[4]) &
+         !(coinfect_date >= close_times[5] & coinfect_date <= close_times[6]) & 
+         !(coinfect_date >= close_times[7] & coinfect_date <= close_times[8])) %>% 
+  as.data.table()
+
+# data set with only co-infections during CLOSED schools
+net_bo_closed <- net_bo5 %>% 
+  anti_join(y = net_bo_open,
+            by = c("RINPERSOON1", "RINPERSOONS1", "RINPERSOONS2", "RINPERSOON2"))
+#saveRDS(net_bo_closed, "H:/Mamba_3.10/additional_variables/net_bo_closed.RDS")
+
+# add back records without co-infection to "open" data
+# (were removed in filtering bc NA)
+net_bo_open <- net_bo_closed %>% 
+  filter(is.na(coinfect_days)) %>% 
+  bind_rows(net_bo_open)
+#saveRDS(net_bo_open, "H:/Mamba_3.10/additional_variables/net_bo_open.RDS")
+```
+
+
+
+
+
